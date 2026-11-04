@@ -23,7 +23,7 @@
 set -Eeuo pipefail
 shopt -s nullglob
 
-VMCTL_VERSION=1.1
+VMCTL_VERSION=1.2
 SELF=$(readlink -f "$0")
 CONF_DIR=/etc/vmctl
 CONF=$CONF_DIR/vmctl.conf
@@ -3620,7 +3620,7 @@ cmd_info() {
     local name=$1 proto hp gp allow label
     load_vm "$name"
     msg "$name ($OS_LABEL): $(vm_state "$name"), install status $STATUS"
-    msg "  RAM $((RAM_MB / 1024)) GB, $CPUS cores, disk $DISK_GB GB, private address $IP"
+    msg "  RAM $((RAM_MB / 1024)) GB, $CPUS cores, disk $DISK_GB GB ($(disk_used "$DISK") used on the server), private address $IP"
     [[ -n ${SETUP_RESULT:-} ]] && msg "  Windows setup: $SETUP_RESULT"
     [[ $STATUS == installing ]] && msg "  Install progress: $(current_stage "$name")  (follow it with: vmctl progress $name)"
     msg "  remote-viewer: open $(vm_vv "$name")"
@@ -3640,8 +3640,8 @@ cmd_info() {
     [[ $KIND == linux ]] && msg "  Serial console on this server: vmctl console $name"
     local d
     for d in ${DATA_DISKS:-}; do
-        if [[ $KIND == windows ]]; then msg "  Data disk ${d%%:*}: ${d#*:} GB (drive labelled Data in Windows)"
-        else msg "  Data disk ${d%%:*}: ${d#*:} GB, mounted at $(data_disk_mount "${d%%:*}")"; fi
+        if [[ $KIND == windows ]]; then msg "  Data disk ${d%%:*}: ${d#*:} GB ($(disk_used "$(data_disk_path "$name" "${d%%:*}")") used on the server, drive labelled Data in Windows)"
+        else msg "  Data disk ${d%%:*}: ${d#*:} GB ($(disk_used "$(data_disk_path "$name" "${d%%:*}")") used on the server), mounted at $(data_disk_mount "${d%%:*}")"; fi
     done
     [[ -n ${SHARE_DIR:-} ]] && msg "  Shared folder: $SHARE_DIR on this server, $(share_where)"
     msg "  Starts automatically with the server: ${AUTOSTART:-yes}"
@@ -3801,9 +3801,418 @@ cmd_disk() {   # vmctl disk add|setup|list|help NAME ...
                 if [[ $KIND == windows ]]; then msg "${d%%:*}: ${d#*:} GB, $(data_disk_path "$name" "${d%%:*}") (drive labelled Data in Windows)"
                 else msg "${d%%:*}: ${d#*:} GB, $(data_disk_path "$name" "${d%%:*}"), mounted at $(data_disk_mount "${d%%:*}")"; fi
             done ;;
+        grow|resize)
+            local id=${3-} size=${4-}
+            [[ -n $id && -n $size ]] || die "usage: vmctl disk grow NAME system|data1|data2... SIZE  (for example: vmctl disk grow $name system 200G)"
+            shift 4
+            if [[ $id == system ]]; then cmd_edit "$name" --disk "$size" "$@"
+            else cmd_edit "$name" --data-disk "$id=$size" "$@"; fi ;;
+        expand) expand_guest_flow "$name" ;;
         help) manual_disk_help "$name" ;;
-        *) die "usage: vmctl disk add NAME SIZE | setup NAME | list NAME | help NAME" ;;
+        *) die "usage: vmctl disk add NAME SIZE | grow NAME ID SIZE | expand NAME | setup NAME | list NAME | help NAME" ;;
     esac
+}
+
+# ---------------------------------------------------------------- edit (RAM, CPUs, disk sizes)
+# Disks only grow: qemu-img/blockresize make the qcow2 bigger (it stays thin,
+# taking space only as the VM writes), then the guest agent grows the
+# partition and filesystem inside the VM so the space can be used.
+
+disk_vsize_gb() {   # disk_vsize_gb FILE -> virtual size in GB (rounded down)
+    local b
+    b=$(qemu-img info -U --output=json "$1" 2>/dev/null | jq -r '."virtual-size" // empty') || return 1
+    [[ -n $b ]] || return 1
+    echo $(( b / 1073741824 ))
+}
+
+disk_target() {   # disk_target NAME FILE -> vda, vdb... (as the VM sees it now)
+    "${VIRSH[@]}" domblklist "$1" 2>/dev/null | awk -v p="$2" '$2 == p {print $1; f = 1; exit} END {exit !f}'
+}
+
+data_disk_gb() {   # data_disk_gb ID (VM loaded) -> size in the record, or nothing
+    local d
+    for d in ${DATA_DISKS:-}; do [[ ${d%%:*} == "$1" ]] && { echo "${d#*:}"; return 0; }; done
+    return 1
+}
+
+all_vm_disks_gb() {   # what every vmctl disk together could grow to
+    local e total=0
+    for e in "$VMS_DIR"/*.env; do
+        total=$(( total + $( ( load_vm "$(basename "$e" .env)"; t=${DISK_GB:-0}
+                              for d in ${DATA_DISKS:-}; do t=$(( t + ${d#*:} )); done; echo "$t" ) ) ))
+    done
+    echo "$total"
+}
+
+# grow_disk NAME ID GB (VM loaded): make the disk image bigger and update the record.
+grow_disk() {
+    local name=$1 id=$2 gb=$3 path target what d new=
+    path=$(disk_of "$name" "$id")
+    [[ -f $path ]] || die "the disk file $path is missing"
+    what="system disk"; [[ $id == system ]] || what="data disk $id"
+    if [[ $(vm_state "$name") == running ]]; then
+        target=$(disk_target "$name" "$path") || die "cannot find the $what in the running $name"
+        "${VIRSH[@]}" blockresize "$name" "$target" "${gb}G" >/dev/null || die "growing the $what failed"
+        msg "Grew the $what to $gb GB while $name is running (it sees the bigger disk at once)."
+    else
+        qemu-img resize -q "$path" "${gb}G" || die "growing the $what failed"
+        msg "Grew the $what to $gb GB."
+    fi
+    msg "  It takes $(disk_used "$path") on the server now and only grows as data is written."
+    if [[ $id == system ]]; then
+        set_env "$name" DISK_GB "$gb"; DISK_GB=$gb
+    else
+        for d in ${DATA_DISKS:-}; do
+            if [[ ${d%%:*} == "$id" ]]; then new+=" $id:$gb"; else new+=" $d"; fi
+        done
+        new=${new# }; set_env "$name" DATA_DISKS "$new"; DATA_DISKS=$new
+    fi
+    event "$name" "Grew the $what to $gb GB"
+}
+
+# PowerShell: grow every lettered partition to the end of its disk (C: is the
+# last partition, Data drives are the only partition on their disk).
+windows_expand_ps() {
+    cat <<'EOF'
+$ProgressPreference = 'SilentlyContinue'
+$script:bad = 0
+Update-HostStorageCache
+Get-Partition | Where-Object { "$($_.DriveLetter)" -match '^[A-Z]$' } | ForEach-Object {
+    $p = $_
+    try {
+        $s = Get-PartitionSupportedSize -DiskNumber $p.DiskNumber -PartitionNumber $p.PartitionNumber -ErrorAction Stop
+        if ($s.SizeMax -gt $p.Size + 100MB) {
+            Resize-Partition -DiskNumber $p.DiskNumber -PartitionNumber $p.PartitionNumber -Size $s.SizeMax -ErrorAction Stop
+            "drive $($p.DriveLetter): grown from $([math]::Round($p.Size / 1GB)) GB to $([math]::Round($s.SizeMax / 1GB)) GB"
+        } else {
+            "drive $($p.DriveLetter): already uses its whole disk ($([math]::Round($p.Size / 1GB)) GB)"
+        }
+    } catch {
+        "drive $($p.DriveLetter): could not be grown: $($_.Exception.Message)"
+        $script:bad = 1
+    }
+}
+exit $script:bad
+EOF
+}
+
+# POSIX sh run inside a Linux guest: grows the partition (plain or LVM) under /
+# and its filesystem, plus the data disks given as arguments. Changes nothing
+# when the root partition is not the last one on its disk, or is encrypted.
+linux_expand_script() {
+    cat <<'EOF'
+bad=0
+say() { echo "$*"; }
+grow_part() {   # grow_part DEVICE: grow a partition to the end of its disk
+    dev=$(readlink -f "$1"); n=$(basename "$dev")
+    [ -e "/sys/class/block/$n/partition" ] || return 0          # a whole disk
+    num=$(cat "/sys/class/block/$n/partition")
+    dn=$(basename "$(readlink -f "/sys/class/block/$n/..")"); disk=/dev/$dn
+    start=$(cat "/sys/class/block/$n/start")
+    for s in /sys/class/block/"$dn"/"$dn"*/start; do
+        if [ "$(cat "$s")" -gt "$start" ]; then
+            say "$dev is not the last partition on $disk (another one, often swap, comes after it), so it cannot be grown automatically."
+            return 1
+        fi
+    done
+    if command -v growpart >/dev/null 2>&1; then
+        out=$(growpart "$disk" "$num" 2>&1) || { case $out in *NOCHANGE*) return 0 ;; esac; say "$out"; return 1; }
+    else
+        sfdisk --relocate gpt-bak-std "$disk" >/dev/null 2>&1 || true
+        echo ', +' | sfdisk --force --no-reread -N "$num" "$disk" >/dev/null 2>&1 || { say "sfdisk could not grow $dev"; return 1; }
+        partx -u "$disk" 2>/dev/null || partprobe "$disk" 2>/dev/null || true
+    fi
+    say "partition $dev now reaches the end of $disk"
+}
+grow_fs() {   # grow_fs DEVICE MOUNTPOINT TYPE
+    case $3 in
+        ext2|ext3|ext4) resize2fs "$1" >/dev/null 2>&1 || { say "resize2fs $1 failed"; return 1; } ;;
+        xfs) xfs_growfs "$2" >/dev/null 2>&1 || { say "xfs_growfs $2 failed"; return 1; } ;;
+        btrfs) btrfs filesystem resize max "$2" >/dev/null 2>&1 || { say "btrfs resize of $2 failed"; return 1; } ;;
+        *) say "the $3 filesystem on $2 cannot be grown automatically"; return 1 ;;
+    esac
+}
+src=$(findmnt -no SOURCE / | sed 's/\[.*//'); fs=$(findmnt -no FSTYPE /)
+if lvs --noheadings -o vg_name "$src" >/dev/null 2>&1; then
+    vg=$(lvs --noheadings -o vg_name "$src" | tr -d ' ')
+    for pv in $(pvs --noheadings -o pv_name -S vg_name="$vg" | tr -d ' '); do
+        case $(basename "$(readlink -f "$pv")") in dm-*) say "the disk under / is encrypted, so it cannot be grown automatically"; bad=1; continue ;; esac
+        grow_part "$pv" && pvresize "$pv" >/dev/null 2>&1 || bad=1
+    done
+    out=$(lvextend -r -l +100%FREE "$src" 2>&1) || case $out in *"matches existing size"*|*"not larger than existing"*) ;; *) say "$out"; bad=1 ;; esac
+else
+    case $(basename "$(readlink -f "$src")") in
+        dm-*) say "/ is on an encrypted or mapped device, so it cannot be grown automatically"; bad=1 ;;
+        *) if grow_part "$src"; then grow_fs "$src" / "$fs" || bad=1; else bad=1; fi ;;
+    esac
+fi
+say "/ is now $(df -h --output=size / | tail -n1 | tr -d ' ') ($(df -h --output=avail / | tail -n1 | tr -d ' ') free)"
+for id in "$@"; do
+    dev=/dev/disk/by-id/virtio-vmctl-$id
+    [ -e "$dev" ] || { say "data disk $id is not attached"; continue; }
+    t=$(blkid -o value -s TYPE "$dev" 2>/dev/null || true)
+    [ -n "$t" ] || { say "data disk $id is not formatted yet (run: vmctl disk setup)"; continue; }
+    mnt=$(findmnt -no TARGET "$dev" | head -n1)
+    [ -n "$mnt" ] || { say "data disk $id is not mounted"; continue; }
+    grow_fs "$dev" "$mnt" "$t" && say "data disk $id at $mnt is now $(df -h --output=size "$mnt" | tail -n1 | tr -d ' ')" || bad=1
+done
+exit $bad
+EOF
+}
+
+expand_in_guest() {   # expand_in_guest NAME (VM loaded, running, agent up) -> 1 when something failed
+    local name=$1 out d ids=() rc=0
+    if [[ $KIND == windows ]]; then
+        out=$(guest_exec "$name" 900 powershell.exe -NoProfile -ExecutionPolicy Bypass -EncodedCommand "$(windows_expand_ps | ps_encode)") || rc=1
+        out=$(grep -v -e '^#< CLIXML' -e '^<Objs ' <<<"$out" || true)
+    else
+        for d in ${DATA_DISKS:-}; do ids+=("${d%%:*}"); done
+        out=$(guest_exec "$name" 600 /bin/sh -c "$(linux_expand_script)" sh "${ids[@]}") || rc=1
+    fi
+    [[ -n $out ]] && sed 's/^/  /' <<<"$out"
+    (( rc == 0 )) && event "$name" "Grew the partitions inside the VM to use the new disk space"
+    return "$rc"
+}
+
+manual_expand_help() {
+    if [[ $KIND == windows ]]; then
+        msg "  In Windows: open Disk Management (diskmgmt.msc), choose drive C: (or the Data drive), then Extend Volume, and accept the maximum size."
+    else
+        msg "  Inside the VM, as root: grow the partition with growpart (for example: growpart /dev/vda 1),"
+        msg "  then the filesystem: resize2fs (ext4), xfs_growfs / (XFS) or btrfs filesystem resize max / ."
+        msg "  With LVM: pvresize the partition, then lvextend -r -l +100%FREE on the root volume."
+    fi
+}
+
+# Grow partitions/filesystems inside the VM, offering to start it first.
+expand_guest_flow() {   # expand_guest_flow NAME
+    local name=$1
+    load_vm "$name"
+    [[ $STATUS == installing ]] && die "$name is still installing; try again when it has finished"
+    step "Letting $name use the new disk space (growing its partitions inside the VM)"
+    if [[ $(vm_state "$name") != running ]]; then
+        if (( INTERACTIVE )) && yes_no "$name is off. Start it now so the space can be added inside it?"; then
+            "${VIRSH[@]}" start "$name" >/dev/null || die "could not start $name"
+            msg "Started $name."
+        else
+            msg "When $name is running, run: vmctl disk expand $name"
+            return 0
+        fi
+    fi
+    if ! agent_up "$name"; then
+        msg "Waiting for the guest agent in $name (up to 10 minutes)."
+        if ! share_wait_agent "$name"; then
+            warn "the guest agent in $name is not answering, so this cannot be done from here."
+            manual_expand_help; return 1
+        fi
+    fi
+    if expand_in_guest "$name"; then msg "Done: $name can use the new space."
+    else warn "not everything could be grown inside $name (see above)"; manual_expand_help; return 1; fi
+}
+
+usage_edit() {
+    cat <<'EOF'
+vmctl edit NAME [options]         (no options: a numbered menu asks what to change)
+  --ram SIZE           memory, e.g. 16G or 12288M
+  --cpus N             CPU cores
+  --disk SIZE          new size of the system disk, e.g. 200G
+  --data-disk ID=SIZE  new size of a data disk, e.g. data1=500G (see: vmctl disk list NAME)
+  --restart            if the VM is running, restart it now so new RAM/CPUs take effect
+  --no-restart         keep it running; new RAM/CPUs take effect at its next start
+  -y, --yes            do not ask for confirmation
+Disks can only grow (shrinking would destroy data). They stay thin: growing one takes no
+space on the server until the VM writes data. Afterwards vmctl grows the partition and
+filesystem inside the VM (Windows: C: and the Data drive; Linux: / and /data) through the
+guest agent. If the VM is off it offers to start it; or later run: vmctl disk expand NAME
+EOF
+}
+
+cmd_edit() {   # vmctl edit NAME [--ram SIZE] [--cpus N] [--disk SIZE] [--data-disk ID=SIZE]... [--restart|--no-restart] [-y]
+    local name= ram_in= cpus_in= disk_in= restart= yes=0 dd=() x
+    while (( $# )); do
+        case $1 in
+            --ram) ram_in=${2:?--ram needs a size}; shift ;;
+            --cpus) cpus_in=${2:?--cpus needs a number}; shift ;;
+            --disk) disk_in=${2:?--disk needs a size}; shift ;;
+            --data-disk) dd+=("${2:?--data-disk needs ID=SIZE}"); shift ;;
+            --restart) restart=yes ;;
+            --no-restart) restart=no ;;
+            -y|--yes) yes=1 ;;
+            -h|--help) usage_edit; return 0 ;;
+            -*) die "unknown option $1 (see: vmctl edit --help)" ;;
+            *) [[ -z $name ]] || die "too many names"; name=$1 ;;
+        esac
+        shift
+    done
+    [[ -n $name ]] || { usage_edit; die "which VM? (vmctl edit NAME)"; }
+    load_vm "$name"
+    [[ $STATUS == installing ]] && die "$name is still installing; change it when the install has finished"
+
+    # What it has now. The disk sizes come from the images themselves.
+    local cur_disk new_ram=$RAM_MB new_cpus=$CPUS new_disk d id gb
+    cur_disk=$(disk_vsize_gb "$DISK") || cur_disk=$DISK_GB
+    new_disk=$cur_disk
+    local -A cur_data=() new_data=()
+    for d in ${DATA_DISKS:-}; do
+        id=${d%%:*}
+        cur_data[$id]=$(disk_vsize_gb "$(data_disk_path "$name" "$id")") || cur_data[$id]=${d#*:}
+        new_data[$id]=${cur_data[$id]}
+    done
+
+    set_ram() { local mb; mb=$(to_mb "$1") && (( mb >= 512 )) || die "please give a RAM size like 8G (at least 512M)"; new_ram=$mb; }
+    set_cpus() { [[ $1 =~ ^[0-9]+$ ]] && (( $1 >= 1 && $1 <= 255 )) || die "please give a number of CPU cores (1 or more)"; new_cpus=$1; }
+    set_size() {   # set_size ID SIZE
+        local g cur
+        g=$(to_gb "$2") || die "please give a disk size like 200G"
+        if [[ $1 == system ]]; then cur=$cur_disk; else
+            [[ -n ${cur_data[$1]-} ]] || die "$name has no data disk $1 (see: vmctl disk list $name)"; cur=${cur_data[$1]}; fi
+        (( g >= cur )) || die "disks can only grow: the $([[ $1 == system ]] && echo "system disk" || echo "data disk $1") is $cur GB, so the new size must be $cur GB or more (making it smaller would destroy data)"
+        if [[ $1 == system ]]; then new_disk=$g; else new_data[$1]=$g; fi
+    }
+    [[ -n $ram_in ]] && set_ram "$ram_in"
+    [[ -n $cpus_in ]] && set_cpus "$cpus_in"
+    [[ -n $disk_in ]] && set_size system "$disk_in"
+    for x in "${dd[@]}"; do
+        [[ $x == *=* ]] || die "--data-disk needs ID=SIZE, for example data1=500G"
+        set_size "${x%%=*}" "${x#*=}"
+    done
+
+    # No options: ask what to change.
+    if [[ -z $ram_in$cpus_in$disk_in && ${#dd[@]} -eq 0 ]]; then
+        (( INTERACTIVE )) || { usage_edit; die "nothing to change"; }
+        local c opts acts ans ids
+        while :; do
+            opts=("RAM: $((new_ram / 1024)) GB$( (( new_ram != RAM_MB )) && echo " (was $((RAM_MB / 1024)) GB)" || true)"
+                  "CPU cores: $new_cpus$( (( new_cpus != CPUS )) && echo " (was $CPUS)" || true)"
+                  "System disk: $new_disk GB$( (( new_disk != cur_disk )) && echo " (was $cur_disk GB)" || true)")
+            acts=(ram cpus system)
+            for id in "${!new_data[@]}"; do
+                opts+=("Data disk $id: ${new_data[$id]} GB$( (( new_data[$id] != cur_data[$id] )) && echo " (was ${cur_data[$id]} GB)" || true)")
+                acts+=("$id")
+            done
+            opts+=("Apply the changes" "Cancel"); acts+=(apply cancel)
+            menu c "What do you want to change on $name? Pick one, then pick Apply when you are done." "${opts[@]}"
+            case ${acts[c-1]} in
+                ram)  ask ans "New RAM size, for example 16G" "$((new_ram / 1024))G"; ( set_ram "$ans" ) && set_ram "$ans" ;;
+                cpus) ask ans "New number of CPU cores (this server has $(nproc) threads)" "$new_cpus"; ( set_cpus "$ans" ) && set_cpus "$ans" ;;
+                system) ask ans "New system disk size, for example $((cur_disk + 100))G (it can only grow)" "${new_disk}G"; ( set_size system "$ans" ) && set_size system "$ans" ;;
+                apply) break ;;
+                cancel) msg "Nothing was changed."; return 0 ;;
+                *) id=${acts[c-1]}; ask ans "New size of data disk $id, for example $((cur_data[$id] + 100))G (it can only grow)" "${new_data[$id]}G"
+                   ( set_size "$id" "$ans" ) && set_size "$id" "$ans" ;;
+            esac
+        done
+        yes=0
+    fi
+
+    # What changes.
+    local hw=0 grow=() changes=() grow_gb=0
+    (( new_ram != RAM_MB )) && { hw=1; changes+=("RAM from $((RAM_MB / 1024)) GB to $((new_ram / 1024)) GB"); }
+    (( new_cpus != CPUS )) && { hw=1; changes+=("CPU cores from $CPUS to $new_cpus"); }
+    (( new_disk != cur_disk )) && { grow+=("system:$new_disk"); grow_gb=$(( grow_gb + new_disk - cur_disk )); changes+=("system disk from $cur_disk GB to $new_disk GB"); }
+    for id in "${!new_data[@]}"; do
+        (( new_data[$id] != cur_data[$id] )) || continue
+        grow+=("$id:${new_data[$id]}"); grow_gb=$(( grow_gb + new_data[$id] - cur_data[$id] ))
+        changes+=("data disk $id from ${cur_data[$id]} GB to ${new_data[$id]} GB")
+    done
+    (( ${#changes[@]} )) || { msg "Nothing to change: $name already has those settings."; return 0; }
+
+    # Will it fit?
+    local st problems=() avail free total fs_gb p
+    st=$(vm_state "$name")
+    if (( hw )); then
+        avail=$(( $(awk '/^MemAvailable:/ {print $2}' /proc/meminfo) / 1024 ))
+        [[ $st == running ]] && avail=$(( avail + RAM_MB ))
+        (( new_cpus <= $(nproc) )) || problems+=("$new_cpus cores requested but this server has only $(nproc) CPU threads.")
+        (( new_ram <= avail - RESERVE_RAM_MB )) || problems+=("$((new_ram / 1024)) GB RAM requested but only about $((avail / 1024)) GB is available and $((RESERVE_RAM_MB / 1024)) GB is kept for the server.")
+    fi
+    if (( grow_gb > 0 )); then
+        free=$(( $(df -Pk "$STORE" | awk 'NR==2 {print $4}') / 1048576 ))
+        (( grow_gb <= free )) || problems+=("the disks grow by $grow_gb GB but only $free GB is free in $STORE.")
+    fi
+    msg "Changes for $name:"
+    for p in "${changes[@]}"; do msg "  $p"; done
+    if (( grow_gb > 0 )); then
+        total=$(( $(all_vm_disks_gb) + grow_gb ))
+        fs_gb=$(( $(df -Pk "$STORE" | awk 'NR==2 {print $2}') / 1048576 ))
+        msg "Disks stay thin: this takes no space on the server until $name writes data."
+        (( total > fs_gb )) && msg "Note: all VM disks together could grow to $total GB, but the server's disk holds $fs_gb GB. If they all fill up, the VMs pause until space is freed."
+    fi
+    if (( ${#problems[@]} )); then
+        for p in "${problems[@]}"; do warn "$p"; done
+        (( yes )) || confirm "The VM may run slowly or affect other services on this server." || die "cancelled"
+    elif (( ! yes )); then
+        confirm "Apply these changes?" || die "cancelled"
+    fi
+
+    # RAM and CPUs: into the saved settings (used from the next start).
+    if (( hw )); then
+        step "Changing RAM and CPU cores"
+        if (( new_ram != RAM_MB )); then
+            # Order matters: the current size may never be above the maximum.
+            if (( new_ram > RAM_MB )); then
+                "${VIRSH[@]}" setmaxmem "$name" "${new_ram}M" --config >/dev/null && "${VIRSH[@]}" setmem "$name" "${new_ram}M" --config >/dev/null
+            else
+                "${VIRSH[@]}" setmem "$name" "${new_ram}M" --config >/dev/null && "${VIRSH[@]}" setmaxmem "$name" "${new_ram}M" --config >/dev/null
+            fi || die "changing the RAM failed"
+            set_env "$name" RAM_MB "$new_ram"
+            msg "RAM set to $((new_ram / 1024)) GB."
+            event "$name" "RAM changed from $((RAM_MB / 1024)) GB to $((new_ram / 1024)) GB"
+        fi
+        if (( new_cpus != CPUS )); then
+            # One socket with N cores: Windows 10/11 Home and Pro use at most 2 sockets.
+            virt-xml --connect qemu:///system "$name" --edit --vcpus "$new_cpus,sockets=1,cores=$new_cpus,threads=1" \
+                >>/var/log/vmctl-install.log 2>&1 || die "changing the CPU cores failed (see /var/log/vmctl-install.log)"
+            set_env "$name" CPUS "$new_cpus"
+            msg "CPU cores set to $new_cpus."
+            event "$name" "CPU cores changed from $CPUS to $new_cpus"
+        fi
+    fi
+
+    # Disks: bigger images now (also while running), then the space inside the VM.
+    if (( ${#grow[@]} )); then
+        step "Growing the disks"
+        for x in "${grow[@]}"; do grow_disk "$name" "${x%%:*}" "${x#*:}"; done
+    fi
+
+    local need_restart=0 expanded=0
+    (( hw )) && [[ $st == running ]] && need_restart=1
+    if (( ${#grow[@]} )); then
+        if [[ $st == running ]]; then
+            step "Letting $name use the new disk space (growing its partitions inside the VM)"
+            if agent_up "$name"; then
+                if expand_in_guest "$name"; then expanded=1; else warn "not everything could be grown inside $name (see above)"; manual_expand_help; fi
+            else
+                warn "the guest agent in $name is not answering."
+                (( need_restart )) && msg "It is tried again after the restart." || { msg "When it answers, run: vmctl disk expand $name"; manual_expand_help; }
+            fi
+        fi
+    fi
+
+    if (( need_restart )); then
+        if [[ -z $restart ]]; then
+            restart=no
+            (( INTERACTIVE )) && yes_no "$name is running. Restart it now so it gets the new RAM and CPU cores? It shuts down cleanly first." && restart=yes
+        fi
+        if [[ $restart == yes ]]; then
+            step "Restarting $name"
+            power_off_clean "$name" "$( (( yes )) && echo force || echo ask)" || die "$name is still running; the new RAM and CPU cores take effect at its next full shutdown and start"
+            if (( ${#grow[@]} && ! expanded )); then
+                "${VIRSH[@]}" start "$name" >/dev/null || die "could not start $name; start it with: vmctl start $name"
+                msg "Started $name."
+                expand_guest_flow "$name" || true
+            elif (( INTERACTIVE )); then cmd_boot "$name"
+            else "${VIRSH[@]}" start "$name" >/dev/null && msg "Started $name."; fi
+        else
+            msg "$name keeps running with its old RAM and CPU cores; the new ones take effect after a full shutdown and start"
+            msg "(a restart from inside the VM is not enough): vmctl stop $name, then vmctl start $name"
+        fi
+    elif (( ${#grow[@]} )) && [[ $st != running ]]; then
+        expand_guest_flow "$name" || true
+    elif (( hw )); then
+        msg "The new settings are used from the next start of $name."
+    fi
+    return 0
 }
 
 # ---------------------------------------------------------------- full cleanup
@@ -4222,7 +4631,7 @@ snap_take() {   # vmctl snapshot take NAME [SNAP] [--note TEXT] [--with-data] [-
 }
 
 snap_restore() {   # vmctl snapshot restore NAME SNAP [--with-data|--no-data] [--yes] [--no-watch]
-    local name= snap= data= yes=0 watch=1 ids=system id f dir was nv tpm
+    local name= snap= data= yes=0 watch=1 ids=system id f dir was nv tpm want have regrown=0
     while (( $# )); do
         case $1 in
             --with-data) data=1 ;;
@@ -4272,6 +4681,13 @@ snap_restore() {   # vmctl snapshot restore NAME SNAP [--with-data|--no-data] [-
         f=$(disk_of "$name" "$id")
         qemu-img snapshot -a "vmctl-$snap" "$f" || { snap_unlock; die "restoring $f failed"; }
         msg "Restored the $([[ $id == system ]] && echo "system disk" || echo "data disk $id")."
+        # The snapshot also holds the disk size from back then; if the disk
+        # was grown since, give it its current size again.
+        want=$DISK_GB; [[ $id == system ]] || want=$(data_disk_gb "$id") || want=0
+        have=$(disk_vsize_gb "$f") || have=$want
+        if (( have < want )); then
+            qemu-img resize -q "$f" "${want}G" && regrown=1 && msg "  It was $have GB in the snapshot; grown back to $want GB."
+        fi
     done
     nv=$(vm_nvram "$name")
     if [[ -f $dir/VARS.fd && -n $nv ]]; then
@@ -4290,6 +4706,7 @@ snap_restore() {   # vmctl snapshot restore NAME SNAP [--with-data|--no-data] [-
     snap_unlock
     msg ""
     msg "$name is back at snapshot $snap."
+    (( regrown )) && msg "Inside the VM the partitions are as small as they were then. When it is running, run: vmctl disk expand $name"
     local start=0
     [[ $was == running ]] && start=1
     (( ! start && INTERACTIVE )) && yes_no "Start $name now?" && start=1
@@ -4602,7 +5019,11 @@ vmctl $VMCTL_VERSION - create and manage virtual machines on this server
   vmctl screen NAME              read out the text currently on a VM's screen
   vmctl password NAME [USER]     reset a user's password inside the VM (asks for the new one)
   vmctl autostart NAME [on|off]  start the VM by itself whenever this server starts (or show the setting)
+  vmctl edit NAME                change RAM, CPU cores or disk sizes (asks; see vmctl edit --help)
+        --ram SIZE --cpus N --disk SIZE --data-disk ID=SIZE [--restart|--no-restart] [-y]
   vmctl disk add NAME SIZE       add a data disk (formatted and mounted inside the VM, kept after restarts)
+  vmctl disk grow NAME ID SIZE   make a disk bigger (ID: system, data1...) and use the space inside the VM
+  vmctl disk expand NAME         grow the partitions inside the VM to fill its disks (e.g. after a restore)
   vmctl disk setup NAME          format/mount data disks inside the VM (e.g. after installing Linux from an ISO)
   vmctl disk list NAME           show a VM's data disks
   vmctl disk help NAME           commands to set up the data disks by hand
@@ -4631,6 +5052,7 @@ main() {
     case $cmd in help|-h|--help) usage; return ;; esac
     case "$cmd ${1-}" in "snapshot help"|"snapshot -h"|"snapshot --help") load_conf 2>/dev/null || true; usage_snapshot; return ;; esac
     case "$cmd ${1-}" in "share help"|"share -h"|"share --help") usage_share; return ;; esac
+    case "$cmd ${1-}" in "edit help"|"edit -h"|"edit --help") usage_edit; return ;; esac
     need_root
     write_default_conf
     load_conf
@@ -4664,6 +5086,7 @@ main() {
         autostart) cmd_autostart "$@" ;;
         check)    ensure_network; vmsg "Server check finished: ready to run virtual machines" ;;
         disk)     cmd_disk "$@" ;;
+        edit)     cmd_edit "$@" ;;
         snapshot|snap) cmd_snapshot "$@" ;;
         owner)    cmd_owner "$@" ;;
         share)    cmd_share "$@" ;;

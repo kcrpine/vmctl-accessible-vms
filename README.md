@@ -85,12 +85,38 @@ To connect:
 | `vmctl password NAME [USER]` | Reset a password inside the VM |
 | `vmctl forward add NAME HOSTPORT GUESTPORT` | Open another port to the VM |
 | `vmctl disk add NAME SIZE` | Add a data disk (formatted and mounted for you) |
+| `vmctl edit NAME` | Change RAM, CPU cores or disk sizes (menu, or `--ram`, `--cpus`, `--disk`, `--data-disk`) |
+| `vmctl disk grow NAME ID SIZE` | Make one disk bigger (`system`, `data1`...) and use the space inside the VM |
+| `vmctl disk expand NAME` | Grow the partitions inside the VM to fill its disks |
 | `vmctl autostart NAME on\|off` | Start the VM whenever the server starts |
 | `vmctl snapshot ...` | Take, list, restore and delete snapshots; daily settings |
 | `vmctl share ...` | Give the VM a folder from the server |
 | `vmctl owner NAME USER` | Let a server user manage this VM's snapshots and shared folder |
 | `vmctl delete NAME` | Delete a VM, its disks, ports and firewall rules |
 | `vmctl help` | Everything else |
+
+## Changing a VM (RAM, CPUs, disk size)
+
+Run `vmctl edit NAME` for a numbered menu, or give the changes directly:
+
+```
+vmctl edit win11 --ram 16G --cpus 6 --restart
+vmctl edit win11 --disk 200G --data-disk data1=500G
+```
+
+- **RAM and CPU cores** go into the VM's saved settings. If the VM is running, vmctl asks whether to
+  restart it now (`--restart` / `--no-restart` answer up front); it shuts down cleanly first. A restart
+  from inside the VM is not enough, it needs a full shutdown and start. Cores are given as one socket, so
+  Windows Home and Pro use all of them.
+- **Disks can only grow.** Disks are thin: a 2000 GB disk takes only what the VM has written, and growing
+  it takes no extra space on the server. vmctl grows the disk (while running, if the VM is on), then uses
+  the guest agent to grow the partition and filesystem inside the VM: drive C: and the Data drive in
+  Windows, `/` (plain partitions or LVM; ext4, XFS, Btrfs) and `/data` in Linux. If the VM is off, it
+  offers to start it, or run `vmctl disk expand NAME` later.
+- vmctl changes nothing inside a Linux VM when the root partition is not the last one on its disk (for
+  example swap right after it) or is encrypted. It tells you, and the space waits there for you to use.
+- Restoring a snapshot taken before a disk was grown keeps the new disk size; run `vmctl disk expand NAME`
+  afterwards so the VM uses it again.
 
 ## Shared folders
 
