@@ -4,10 +4,12 @@
 #   * Windows 11 / 10 / 11 LTSC / 10 LTSC: ISO is downloaded, installed fully
 #     unattended with VirtIO drivers, sound, RDP on its own host port, and NVDA
 #     installed and set to start at sign-in.
-#   * Tiny11 (trimmed Windows 11, no browser; you give the ISO): installed the
-#     same way, but NVDA is downloaded on this server into a shared folder
-#     (virtiofs, drive Z: in Windows) and installed from there. The folder
-#     stays, for putting other installers (Firefox, Brave...) into the VM.
+#   * Tiny11 (trimmed Windows 11; you give the ISO): installed the same way,
+#     plus a shared folder (virtiofs, drive Z: in Windows) that stays for
+#     putting other installers into the VM. Before the VM is made, vmctl looks
+#     inside the ISO for Edge. Edge there: Windows downloads NVDA itself, like
+#     the other Windows VMs. Edge removed: this server downloads Firefox and
+#     NVDA into the shared folder and Windows installs both from there.
 #   * Shared folders: VM owners give their VM a folder from their home on
 #     this server with "sudo vmctl share" (Windows: a drive, Linux:
 #     /mnt/vmshare). virtiofsd runs as the owner, not as root.
@@ -62,6 +64,8 @@ SNAP_MIN_FREE_GB=20
 VIRTIO_URL=https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.iso
 NVDA_API='https://api.nvaccess.org/nvdaUpdateCheck?versionType=stable'
 WINFSP_API=https://api.github.com/repos/winfsp/winfsp/releases/latest
+FIREFOX_API=https://product-details.mozilla.org/1.0/firefox_versions.json
+FIREFOX_REL=https://archive.mozilla.org/pub/firefox/releases
 WIN11LTSC_URL='https://go.microsoft.com/fwlink/?linkid=2289029&clcid=0x409&culture=en-us&country=us'
 WIN10LTSC_URL='https://go.microsoft.com/fwlink/p/?LinkID=2195404&clcid=0x409&culture=en-us&country=US'
 UA='Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0'
@@ -205,7 +209,7 @@ load_vm() {   # sets NAME OS KIND MODE IP MAC SPICE_PORT SPICE_PASS ALLOW STATUS
     # The name becomes a file that is sourced as root (also for sudo users), so
     # never let it point outside $VMS_DIR.
     [[ $1 =~ ^[A-Za-z][A-Za-z0-9-]{0,14}$ ]] || die "no VM called '$1' (see: vmctl list)"
-    OWNER= SNAP_AUTO= SNAP_KEEP= SHARE_DIR= SHARE_GUEST_ID=   # older records do not have these
+    OWNER= SNAP_AUTO= SNAP_KEEP= SHARE_DIR= SHARE_GUEST_ID= TINY11_BROWSER=   # older records do not have these
     f=$(vm_env "$1")
     [[ -f $f ]] || die "no VM called '$1' (see: vmctl list)"
     # shellcheck source=/dev/null
@@ -216,7 +220,7 @@ save_vm() {   # save_vm NAME  (writes the variables listed below)
     local f k; f=$(vm_env "$1")
     {
         for k in NAME OS OS_LABEL KIND MODE IP MAC SPICE_PORT SPICE_PASS ALLOW STATUS AUTOSTART DATA_DISKS \
-                 RAM_MB CPUS DISK_GB DISK SEED USERNAME CREATED OWNER SNAP_AUTO SNAP_KEEP SHARE_DIR SHARE_GUEST_ID; do
+                 RAM_MB CPUS DISK_GB DISK SEED USERNAME CREATED OWNER SNAP_AUTO SNAP_KEEP SHARE_DIR SHARE_GUEST_ID TINY11_BROWSER; do
             printf '%s=%q\n' "$k" "${!k-}"
         done
     } >"$f.tmp"
@@ -1164,7 +1168,24 @@ prep_tiny11_iso() {
     msg "Edition to install: ${names[i-1]} (image $i of $n)${WIN_KEY:+, with the generic install key}"
     OS_LABEL="Tiny11 (${names[i-1]})"
 
-    # 2. tiny11builder puts its own autounattend.xml in the root of the ISO.
+    # 2. Is there still a browser? tiny11builder deletes Edge's folder, but
+    # some Tiny11 builds keep it. Look for msedge.exe inside the chosen edition
+    # (wimdir reads only the file list, so this takes seconds). Edge there:
+    # Windows uses it and downloads NVDA itself. Not there (or the list could
+    # not be read): Firefox and NVDA go into the shared folder.
+    local listing
+    msg "Looking inside the ISO for a web browser (Microsoft Edge)"
+    listing=$(WIMLIB_IMAGEX_IGNORE_CASE=1 wimdir "$wim" "$i" --path='/Program Files (x86)/Microsoft/Edge/Application' 2>/dev/null || true)
+    if [[ ${listing,,} == *"/application/msedge.exe"* ]]; then
+        TINY11_BROWSER=edge
+        msg "  Edge is in this ISO. Windows will use it, and downloads NVDA itself like the other Windows VMs."
+    else
+        TINY11_BROWSER=firefox
+        msg "  Edge was removed from this ISO. vmctl will put Firefox and NVDA in the shared folder;"
+        msg "  Windows installs Firefox first, then NVDA."
+    fi
+
+    # 3. tiny11builder puts its own autounattend.xml in the root of the ISO.
     # Windows Setup reads the first answer file it finds, which could be that
     # one instead of the one on vmctl's setup disc, and then stops and waits
     # for answers. So boot a copy without it (rebuilt the same way the
@@ -1248,12 +1269,28 @@ In Windows it is a drive (usually Z:).
 Put installers here (for example Firefox or Brave setup files) on the server,
 then run them from this drive inside Windows.
 EOF
-        [[ ${OS:-} == tiny11 ]] && cat >>"$SHARE_DIR/$SHARE_NOTE" <<EOF
+        if [[ ${OS:-} == tiny11 && ${TINY11_BROWSER:-} == edge ]]; then
+            cat >>"$SHARE_DIR/$SHARE_NOTE" <<EOF
+
+This Tiny11 still has Microsoft Edge, so Windows downloaded NVDA itself.
+
+EOF
+        elif [[ ${OS:-} == tiny11 && ${TINY11_BROWSER:-} == firefox ]]; then
+            cat >>"$SHARE_DIR/$SHARE_NOTE" <<EOF
+
+Edge was removed from this Tiny11, so vmctl put the Firefox and NVDA
+installers here during setup. Windows installed Firefox first, then NVDA,
+and each installer was deleted from here once it was installed.
+
+EOF
+        elif [[ ${OS:-} == tiny11 ]]; then   # made before vmctl looked for Edge
+            cat >>"$SHARE_DIR/$SHARE_NOTE" <<EOF
 Tiny11 comes without a browser.
 
 vmctl put the NVDA installer here during setup and deleted it once NVDA was
 installed.
 EOF
+        fi
         echo "Deleting the VM (vmctl delete $name) also deletes this folder." >>"$SHARE_DIR/$SHARE_NOTE"
         sed -i 's/$/\r/' "$SHARE_DIR/$SHARE_NOTE"
     else
@@ -1271,7 +1308,7 @@ EOF
 }
 
 # stage_nvda_on_host DIR - the server downloads the newest NVDA into the shared
-# folder (Tiny11 has no browser). Failing here is not fatal: setup reports
+# folder (Tiny11 with Edge removed). Failing here is not fatal: setup reports
 # that NVDA is missing, the same as when the in-Windows download fails.
 stage_nvda_on_host() {
     local dir=$1 info ver url hash sum
@@ -1296,6 +1333,43 @@ stage_nvda_on_host() {
     printf '%s\r\n' "$ver" >"$dir/nvda-version.txt"
     [[ $dir == "$STORE/shared/"* || -z ${OWNER:-} ]] || chown "$OWNER:$(id -gn "$OWNER")" "$dir/nvda-setup.exe" "$dir/nvda-version.txt"
     msg "  NVDA $ver is in the shared folder (checksum verified)."
+}
+
+# stage_firefox_on_host DIR - for a Tiny11 with Edge removed: the newest
+# Firefox (64-bit, US English, Mozilla's MSI) goes into the shared folder, and
+# setup.ps1 installs it before NVDA. The MSI is checked against Mozilla's
+# SHA512SUMS and cached in $STORE/isos (older versions are removed). Failing
+# here is not fatal: setup reports that Firefox is missing.
+stage_firefox_on_host() {
+    local dir=$1 ver file url sums want sum cache
+    msg "Downloading Firefox into the shared folder (Edge was removed from this Tiny11)"
+    ver=$(curl -fsS --retry 5 --retry-delay 5 --retry-all-errors "$FIREFOX_API" | jq -r '.LATEST_FIREFOX_VERSION // empty' 2>/dev/null || true)
+    if [[ ! $ver =~ ^[0-9][0-9.a-z]*$ ]]; then
+        warn "could not ask Mozilla for the newest Firefox; put firefox-setup.msi in $dir yourself"; return 0
+    fi
+    file="Firefox Setup $ver.msi"
+    url="$FIREFOX_REL/$ver/win64/en-US/${file// /%20}"
+    sums=$(curl -fsS --retry 5 --retry-delay 5 --retry-all-errors "$FIREFOX_REL/$ver/SHA512SUMS" 2>/dev/null || true)
+    want=$(awk -v f="win64/en-US/$file" '{h=$1; $1=""; sub(/^ +/, "")} $0 == f {print h; exit}' <<<"$sums")
+    if [[ -z $want ]]; then
+        warn "Mozilla's checksum list has no entry for $file; put firefox-setup.msi in $dir yourself"; return 0
+    fi
+    cache="$STORE/isos/firefox-$ver.msi"
+    find "$STORE/isos" -maxdepth 1 -name 'firefox-*.msi*' ! -name "firefox-$ver.msi" ! -name "firefox-$ver.msi.part" -delete 2>/dev/null || true
+    if ! ( download "$url" "$cache" ); then
+        warn "the Firefox download failed; put firefox-setup.msi in $dir yourself"; return 0
+    fi
+    sum=$(sha512sum "$cache" | cut -d' ' -f1)
+    if [[ ${sum,,} != "${want,,}" ]]; then
+        rm -f "$cache"
+        warn "the Firefox download was damaged (checksum mismatch) and was removed; put firefox-setup.msi in $dir yourself"
+        return 0
+    fi
+    rm -f "$dir/firefox-setup.msi"
+    cp "$cache" "$dir/firefox-setup.msi"
+    printf '%s\r\n' "$ver" >"$dir/firefox-version.txt"
+    [[ $dir == "$STORE/shared/"* || -z ${OWNER:-} ]] || chown "$OWNER:$(id -gn "$OWNER")" "$dir/firefox-setup.msi" "$dir/firefox-version.txt"
+    msg "  Firefox $ver is in the shared folder (checksum verified)."
 }
 
 # winfsp_msi - prints the path of the cached WinFsp installer (Windows needs it
@@ -2037,9 +2111,62 @@ write_autounattend() {   # write_autounattend FILE NAME USER PASS
 EOF
 }
 
-# write_setup_ps1 FILE [tiny11] - runs once at first logon inside Windows, then
-# powers off. With tiny11, NVDA comes from the shared folder instead of the
-# internet; everything else is the same script.
+# ps_nvda_download - the setup.ps1 part that downloads NVDA inside Windows
+# (every Windows VM, and Tiny11 when its ISO still has Edge).
+ps_nvda_download() {
+    cat <<'EOF'
+Report "STAGE 5/6 Downloading and installing NVDA"
+$api = 'https://api.nvaccess.org/nvdaUpdateCheck?versionType=stable'
+$info = $null
+for ($i = 0; $i -lt 20 -and -not $info; $i++) {
+    try { $info = (Invoke-WebRequest -UseBasicParsing -Uri $api -TimeoutSec 30).Content } catch { Start-Sleep 15 }
+}
+$nvdaOk = $false
+if ($info) {
+    $kv = @{}
+    foreach ($line in ($info -split "`n")) { if ($line -match '^\s*(\w+):\s*(.+?)\s*$') { $kv[$Matches[1]] = $Matches[2] } }
+    $exe = 'C:\vmctl\nvda-setup.exe'
+    $got = $false
+    for ($i = 0; $i -lt 5 -and -not $got; $i++) {
+        try {
+            Report "Downloading NVDA $($kv['version'])"
+            Invoke-WebRequest -UseBasicParsing -Uri $kv['launcherUrl'] -OutFile $exe -TimeoutSec 600
+            $sha = (Get-FileHash -Algorithm SHA1 $exe).Hash.ToLower()
+            if ($kv['launcherHash'] -and $sha -ne $kv['launcherHash'].ToLower()) { throw "SHA1 mismatch: $sha" }
+            $got = $true
+        } catch { Report "NVDA download attempt failed: $_"; Start-Sleep 20 }
+    }
+    if ($got) {
+        Report "Installing NVDA $($kv['version'])"
+        # --enable-start-on-logon=True: NVDA also runs on the Windows sign-in screen.
+        $p = Start-Process -Wait -PassThru -FilePath $exe -ArgumentList '--install-silent','--enable-start-on-logon=True'
+        # "Start NVDA after I sign in" is per user: this user and every future user.
+        # The value is NVDA's Ease of Access name, nvda_nvda_v1 (the same name
+        # the installer writes to HKLM for the sign-in screen) - not "nvda".
+        $acc = 'Software\Microsoft\Windows NT\CurrentVersion\Accessibility'
+        $at = (Get-ItemProperty "HKLM:\$acc" -ErrorAction SilentlyContinue).Configuration
+        if (-not $at) { $at = 'nvda_nvda_v1' }
+        New-Item -Force -Path "HKCU:\$acc" | Out-Null
+        Set-ItemProperty -Path "HKCU:\$acc" -Name Configuration -Value $at
+        & reg.exe load 'HKU\vmctlDefault' 'C:\Users\Default\NTUSER.DAT' | Out-Null
+        & reg.exe add "HKU\vmctlDefault\$acc" /v Configuration /t REG_SZ /d $at /f | Out-Null
+        [gc]::Collect()
+        & reg.exe unload 'HKU\vmctlDefault' | Out-Null
+        $nvdaOk = (Test-Path "${env:ProgramFiles(x86)}\NVDA\nvda.exe") -or (Test-Path "$env:ProgramFiles\NVDA\nvda.exe")
+        if ($nvdaOk) { Report "NVDA $($kv['version']) installed; it starts at sign-in and on the sign-in screen" }
+        else { Report "WARNING: the NVDA installer finished (code $($p.ExitCode)) but nvda.exe was not found" }
+    }
+}
+if (-not $nvdaOk) { Report "WARNING: NVDA could NOT be installed. Install it later from https://www.nvaccess.org/download/" }
+
+EOF
+}
+
+# write_setup_ps1 FILE [tiny11|tiny11-edge] - runs once at first logon inside
+# Windows, then powers off. Both Tiny11 flavors add the shared folder.
+# tiny11 (Edge removed from the ISO): Firefox and then NVDA are installed from
+# the shared folder. tiny11-edge: NVDA is downloaded in Windows as usual.
+# Without a flavor the output is the same as before Tiny11 existed.
 write_setup_ps1() {
   {
     cat <<'EOF'
@@ -2118,8 +2245,9 @@ for ($i = 0; $i -lt 60 -and -not $net; $i++) {
 if ($net) { Report "Network is up" } else { Report "WARNING: no internet connection after 5 minutes" }
 
 EOF
-    if [[ ${2-} == tiny11 ]]; then
-        cat <<'EOF'
+    case ${2-} in
+        tiny11|tiny11-edge)
+            cat <<'EOF'
 Report "Installing WinFsp and the VirtIO-FS service (the shared folder from the server)"
 $p = Start-Process -Wait -PassThru msiexec.exe -ArgumentList '/i', (Join-Path $Src 'vmctl\winfsp.msi'), '/qn', '/norestart'
 if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) { Report "WinFsp installer returned code $($p.ExitCode)" }
@@ -2146,7 +2274,34 @@ for ($i = 0; $i -lt 40 -and -not $share; $i++) {
 if ($share) { Report "The shared folder from the server is drive $($share.Name)" }
 else { Report "WARNING: the shared folder from the server did not show up (VirtioFsSvc: $((Get-Service VirtioFsSvc -ErrorAction SilentlyContinue).Status))" }
 
-Report "STAGE 5/6 Installing NVDA from the shared folder"
+EOF
+            if [[ $2 == tiny11 ]]; then
+                cat <<'EOF'
+Report "STAGE 5/6 Installing Firefox, then NVDA, from the shared folder (Edge was removed from this Tiny11)"
+$ffOk = $false
+if ($share) {
+    $root = $share.RootDirectory.FullName
+    $from = Join-Path $root 'firefox-setup.msi'
+    $vf = Join-Path $root 'firefox-version.txt'
+    $ver = ''
+    if (Test-Path $vf) { $ver = (Get-Content $vf -TotalCount 1).Trim() }
+    if (Test-Path $from) {
+        Report "Copying Firefox $ver from the shared folder"
+        $msi = 'C:\vmctl\firefox-setup.msi'
+        Copy-Item -Force $from $msi
+        Report "Installing Firefox $ver"
+        $p = Start-Process -Wait -PassThru msiexec.exe -ArgumentList '/i', $msi, '/qn', '/norestart'
+        $ffOk = Test-Path "$env:ProgramFiles\Mozilla Firefox\firefox.exe"
+        Remove-Item -Force -ErrorAction SilentlyContinue $msi
+        if ($ffOk) {
+            Report "Firefox $ver installed"
+            Remove-Item -Force -ErrorAction SilentlyContinue $from, $vf
+            Report "Deleted the Firefox installer from the shared folder (the folder itself stays)"
+        } else { Report "WARNING: the Firefox installer finished (code $($p.ExitCode)) but firefox.exe was not found" }
+    } else { Report "WARNING: firefox-setup.msi is not in the shared folder (the server could not download it)" }
+}
+if (-not $ffOk) { Report "WARNING: Firefox could NOT be installed. Put firefox-setup.msi in the shared folder on the server and run it from that drive" }
+
 $nvdaOk = $false
 if ($share) {
     $root = $share.RootDirectory.FullName
@@ -2183,54 +2338,11 @@ if ($share) {
 if (-not $nvdaOk) { Report "WARNING: NVDA could NOT be installed. Put nvda-setup.exe in the shared folder on the server and run it from that drive" }
 
 EOF
-    else
-        cat <<'EOF'
-Report "STAGE 5/6 Downloading and installing NVDA"
-$api = 'https://api.nvaccess.org/nvdaUpdateCheck?versionType=stable'
-$info = $null
-for ($i = 0; $i -lt 20 -and -not $info; $i++) {
-    try { $info = (Invoke-WebRequest -UseBasicParsing -Uri $api -TimeoutSec 30).Content } catch { Start-Sleep 15 }
-}
-$nvdaOk = $false
-if ($info) {
-    $kv = @{}
-    foreach ($line in ($info -split "`n")) { if ($line -match '^\s*(\w+):\s*(.+?)\s*$') { $kv[$Matches[1]] = $Matches[2] } }
-    $exe = 'C:\vmctl\nvda-setup.exe'
-    $got = $false
-    for ($i = 0; $i -lt 5 -and -not $got; $i++) {
-        try {
-            Report "Downloading NVDA $($kv['version'])"
-            Invoke-WebRequest -UseBasicParsing -Uri $kv['launcherUrl'] -OutFile $exe -TimeoutSec 600
-            $sha = (Get-FileHash -Algorithm SHA1 $exe).Hash.ToLower()
-            if ($kv['launcherHash'] -and $sha -ne $kv['launcherHash'].ToLower()) { throw "SHA1 mismatch: $sha" }
-            $got = $true
-        } catch { Report "NVDA download attempt failed: $_"; Start-Sleep 20 }
-    }
-    if ($got) {
-        Report "Installing NVDA $($kv['version'])"
-        # --enable-start-on-logon=True: NVDA also runs on the Windows sign-in screen.
-        $p = Start-Process -Wait -PassThru -FilePath $exe -ArgumentList '--install-silent','--enable-start-on-logon=True'
-        # "Start NVDA after I sign in" is per user: this user and every future user.
-        # The value is NVDA's Ease of Access name, nvda_nvda_v1 (the same name
-        # the installer writes to HKLM for the sign-in screen) - not "nvda".
-        $acc = 'Software\Microsoft\Windows NT\CurrentVersion\Accessibility'
-        $at = (Get-ItemProperty "HKLM:\$acc" -ErrorAction SilentlyContinue).Configuration
-        if (-not $at) { $at = 'nvda_nvda_v1' }
-        New-Item -Force -Path "HKCU:\$acc" | Out-Null
-        Set-ItemProperty -Path "HKCU:\$acc" -Name Configuration -Value $at
-        & reg.exe load 'HKU\vmctlDefault' 'C:\Users\Default\NTUSER.DAT' | Out-Null
-        & reg.exe add "HKU\vmctlDefault\$acc" /v Configuration /t REG_SZ /d $at /f | Out-Null
-        [gc]::Collect()
-        & reg.exe unload 'HKU\vmctlDefault' | Out-Null
-        $nvdaOk = (Test-Path "${env:ProgramFiles(x86)}\NVDA\nvda.exe") -or (Test-Path "$env:ProgramFiles\NVDA\nvda.exe")
-        if ($nvdaOk) { Report "NVDA $($kv['version']) installed; it starts at sign-in and on the sign-in screen" }
-        else { Report "WARNING: the NVDA installer finished (code $($p.ExitCode)) but nvda.exe was not found" }
-    }
-}
-if (-not $nvdaOk) { Report "WARNING: NVDA could NOT be installed. Install it later from https://www.nvaccess.org/download/" }
-
-EOF
-    fi
+            else
+                ps_nvda_download
+            fi ;;
+        *)  ps_nvda_download ;;
+    esac
     cat <<'EOF'
 Report "STAGE 6/6 Finishing: turning off the one-time automatic sign-in and shutting down"
 $wl = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
@@ -2239,12 +2351,16 @@ Remove-ItemProperty $wl -Name DefaultPassword, AutoLogonCount -ErrorAction Silen
 Remove-ItemProperty $runOnce -Name vmctl-setup -ErrorAction SilentlyContinue
 Remove-Item -Force -ErrorAction SilentlyContinue C:\Windows\Panther\unattend.xml, C:\Windows\Panther\Unattend\unattend.xml
 
-"vmctl setup finished $(Get-Date -Format s); NVDA installed: $nvdaOk" | Out-File C:\vmctl-done.txt
+"vmctl setup finished $(Get-Date -Format s); NVDA installed: $nvdaOk@@BROWSER@@" | Out-File C:\vmctl-done.txt
 Stop-Transcript | Out-Null
 # Powering off tells vmctl on the host that the install is complete.
 Stop-Computer -Force
 EOF
-  } >"$1"
+  } | case ${2-} in   # "NVDA installed: ..." stays first: the watcher looks for it
+        tiny11)      sed 's/@@BROWSER@@/; Firefox installed: $ffOk/' ;;
+        tiny11-edge) sed 's/@@BROWSER@@/; Browser: Edge (in the ISO)/' ;;
+        *)           sed 's/@@BROWSER@@//' ;;
+      esac >"$1"
 }
 
 build_windows_seed() {   # build_windows_seed NAME USER PASS VIRTIO_ISO OUT_ISO [tiny11 WINFSP_MSI]
@@ -2278,7 +2394,7 @@ build_windows_seed() {   # build_windows_seed NAME USER PASS VIRTIO_ISO OUT_ISO 
     cp "$mnt/virtio-win-guest-tools.exe" "$work/vmctl/"
     cp "$mnt/guest-agent/qemu-ga-x86_64.msi" "$work/vmctl/"
     msg "  Copied the QEMU guest agent and VirtIO guest tools installers"
-    if [[ $flavor == tiny11 ]]; then
+    if [[ $flavor == tiny11* ]]; then
         cp "$winfsp" "$work/vmctl/winfsp.msi"
         msg "  Copied the WinFsp installer (Windows needs it to see the shared folder)"
     fi
@@ -2287,7 +2403,9 @@ build_windows_seed() {   # build_windows_seed NAME USER PASS VIRTIO_ISO OUT_ISO 
     msg "  Writing the answer file (autounattend.xml): disk layout, account $user, Remote Desktop, no BitLocker"
     write_autounattend "$work/autounattend.xml" "$name" "$user" "$pass"
     if [[ $flavor == tiny11 ]]; then
-        msg "  Writing the first sign-in script (drivers, guest agent, Remote Desktop, shared folder, NVDA from the shared folder)"
+        msg "  Writing the first sign-in script (drivers, guest agent, Remote Desktop, shared folder, Firefox then NVDA from the shared folder)"
+    elif [[ $flavor == tiny11-edge ]]; then
+        msg "  Writing the first sign-in script (drivers, guest agent, Remote Desktop, shared folder, NVDA downloaded in Windows)"
     else
         msg "  Writing the first sign-in script (drivers, guest agent, Remote Desktop, NVDA)"
     fi
@@ -2388,8 +2506,10 @@ usage_create() {
 vmctl create [options]          (anything not given is asked for)
   --name NAME          VM name: letters, digits and dashes, up to 15 characters
   --os OS              win11 | win10 | win11ltsc | win10ltsc | tiny11 | linux-iso | linux-cloud
-                       tiny11: give the ISO with --iso-url or --iso-path; NVDA is installed from a
-                       shared folder on this server (a drive in Windows), which stays for other installers
+                       tiny11: give the ISO with --iso-url or --iso-path. vmctl looks inside it for
+                       Edge first: if Edge is there, Windows downloads NVDA itself; if it was removed,
+                       Firefox and NVDA are installed from a shared folder on this server. Either way
+                       the shared folder (a drive in Windows) stays for other installers
   --distro ID          linux-iso: debian13 ubuntu2604-desktop ubuntu2604-server ubuntu2404-desktop
                        ubuntu2404-server fedora-workstation fedora-server mint custom
                        linux-cloud: debian13 debian12 ubuntu2604 ubuntu2404
@@ -2475,7 +2595,7 @@ cmd_create() {
             "Windows 10 (Pro; may need your own ISO link)" \
             "Windows 11 LTSC (Enterprise LTSC 2024, 90-day evaluation, downloads automatically)" \
             "Windows 10 LTSC (Enterprise LTSC 2021, 90-day evaluation, downloads automatically)" \
-            "Tiny11 (trimmed Windows 11 with no browser; you give the ISO link or file; NVDA comes from a shared folder)" \
+            "Tiny11 (trimmed Windows 11; you give the ISO link or file; uses Edge if the ISO has it, otherwise Firefox from a shared folder)" \
             "Linux from an installer ISO (you install it through remote-viewer)" \
             "Linux cloud image (Debian or Ubuntu, unattended, ready in about a minute)"
         OS=$(echo "win11 win10 win11ltsc win10ltsc tiny11 linux-iso linux-cloud" | cut -d' ' -f"$c")
@@ -2652,7 +2772,10 @@ cmd_create() {
     [[ -n $SSH_PORT ]] && msg "SSH port: $SSH_PORT"
     if (( DATA_GB > 0 )); then msg "Data disk: $DATA_GB GB"; else msg "Data disk: none"; fi
     msg "Starts automatically with the server: $AUTOSTART"
-    [[ $OS == tiny11 ]] && msg "Shared folder (NVDA comes from here; a drive in Windows): $(share_dir "$NAME")"
+    if [[ $OS == tiny11 ]]; then
+        msg "Shared folder (a drive in Windows): $(share_dir "$NAME")"
+        msg "Browser: Edge if the ISO still has it; if not, Firefox and NVDA come from the shared folder (vmctl looks inside the ISO next)"
+    fi
     msg "Allowed to connect: $ALLOW"
     (( YES )) || confirm "Create this VM?" || die "cancelled"
 
@@ -2662,16 +2785,20 @@ cmd_create() {
         winiso)
             step "Getting installation media"
             INSTALL_ISO=$(get_windows_iso "$OS")
-            local flavor= winfsp=
+            local flavor= winfsp= TINY11_BROWSER=
             if [[ $OS == tiny11 ]]; then
-                flavor=tiny11
-                prep_tiny11_iso "$INSTALL_ISO"
+                prep_tiny11_iso "$INSTALL_ISO"   # also looks for Edge: sets TINY11_BROWSER
+                set_env "$NAME" TINY11_BROWSER "$TINY11_BROWSER"
+                if [[ $TINY11_BROWSER == edge ]]; then flavor=tiny11-edge; else flavor=tiny11; fi
                 winfsp=$(winfsp_msi) || die "could not get the WinFsp installer"
                 step "Setting up the shared folder"
                 make_share "$NAME"
                 ensure_share_wrapper
                 set_env "$NAME" SHARE_DIR "$SHARE_DIR"   # so a failed create removes it again
-                stage_nvda_on_host "$SHARE_DIR"
+                if [[ $TINY11_BROWSER == firefox ]]; then
+                    stage_firefox_on_host "$SHARE_DIR"
+                    stage_nvda_on_host "$SHARE_DIR"
+                fi
             fi
             download "$VIRTIO_URL" "$VIRTIO_ISO"
             SEED="$STORE/seed/$NAME-unattend.iso"
@@ -2831,8 +2958,13 @@ cmd_create() {
         if [[ $OS == tiny11 ]]; then
             msg ""
             msg "Shared folder: $SHARE_DIR on this server is a drive in Windows (usually Z:)."
-            msg "NVDA is installed from it and its installer is then deleted. Put other installers"
-            msg "there (for example Firefox or Brave) and run them from that drive in Windows."
+            if [[ $TINY11_BROWSER == edge ]]; then
+                msg "This Tiny11 still has Edge, so Windows downloads NVDA itself."
+            else
+                msg "Edge was removed from this Tiny11: Windows installs Firefox and then NVDA from"
+                msg "that folder, and each installer is deleted from it once it is installed."
+            fi
+            msg "Put other installers there and run them from that drive in Windows."
         fi
         msg ""
         want_watch "$NAME" "the Windows install" "vmctl progress $NAME" "The install carries on by itself." \
@@ -3153,6 +3285,10 @@ cmd_watch_install() {
     if [[ -n ${SHARE_DIR:-} && -f $SHARE_DIR/nvda-setup.exe && $out == *"NVDA installed: True"* ]]; then
         rm -f "$SHARE_DIR/nvda-setup.exe" "$SHARE_DIR/nvda-version.txt"
         event "$name" "Removed the NVDA installer from the shared folder (the folder stays: $SHARE_DIR)"
+    fi
+    if [[ -n ${SHARE_DIR:-} && -f $SHARE_DIR/firefox-setup.msi && $out == *"Firefox installed: True"* ]]; then
+        rm -f "$SHARE_DIR/firefox-setup.msi" "$SHARE_DIR/firefox-version.txt"
+        event "$name" "Removed the Firefox installer from the shared folder (the folder stays: $SHARE_DIR)"
     fi
     if [[ -n ${DATA_DISKS:-} ]]; then
         event "$name" "Formatting the data disk inside Windows (NTFS, label Data)"
@@ -3622,6 +3758,10 @@ cmd_info() {
     msg "$name ($OS_LABEL): $(vm_state "$name"), install status $STATUS"
     msg "  RAM $((RAM_MB / 1024)) GB, $CPUS cores, disk $DISK_GB GB ($(disk_used "$DISK") used on the server), private address $IP"
     [[ -n ${SETUP_RESULT:-} ]] && msg "  Windows setup: $SETUP_RESULT"
+    case ${TINY11_BROWSER:-} in
+        edge)    msg "  Browser: Edge (it was in the Tiny11 ISO)" ;;
+        firefox) msg "  Browser: Firefox (Edge was removed from the Tiny11 ISO; installed from the shared folder)" ;;
+    esac
     [[ $STATUS == installing ]] && msg "  Install progress: $(current_stage "$name")  (follow it with: vmctl progress $name)"
     msg "  remote-viewer: open $(vm_vv "$name")"
     msg "    or run: remote-viewer spice://$PUBLIC_HOST:$SPICE_PORT  (password $SPICE_PASS)"

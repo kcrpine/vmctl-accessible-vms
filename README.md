@@ -9,7 +9,7 @@ What it does:
 - **Reads the screen for you.** While a VM boots or installs, vmctl reads its screen text with OCR and announces the steps: Windows Setup stages, disk checks, the sign-in screen.
 - **Remote access ports.** Each VM gets its own port for remote-viewer (SPICE) and Remote Desktop or SSH. You can forward more ports (`vmctl forward`) and limit who may connect (`--allow`).
 - **Snapshots.** You can take snapshots by hand and roll back, and there are daily automatic snapshots with a limit on how many are kept.
-- **Shared folders.** A VM can use a folder on the server: a drive in Windows, `/mnt/vmshare` in Linux. That makes it easy to get installers, for example a browser for Tiny11, documents or music into a VM.
+- **Shared folders.** A VM can use a folder on the server: a drive in Windows, `/mnt/vmshare` in Linux. That makes it easy to get installers, documents or music into a VM.
 - **VM owners.** You can let ordinary server users manage snapshots and shared folders of *their own* VMs through `sudo`, without giving them root.
 - **Installs what it needs.** On first use it installs its dependencies with apt, dnf, zypper or pacman.
 
@@ -69,7 +69,11 @@ To connect:
 
 - **Windows 11 LTSC and Windows 10 LTSC** (90-day evaluation) download automatically from Microsoft.
 - **Windows 11 and Windows 10 (consumer editions):** vmctl asks Microsoft for a download link. Microsoft often refuses these requests from data-centre IP addresses. In that case, get a link on your own computer from Microsoft's download page and pass it with `--iso-url`, or upload the ISO and use `--iso-path`.
-- **Tiny11:** Microsoft doesn't host it, so give it with `--iso-url` or `--iso-path`. Tiny11 has no web browser, so the server downloads NVDA itself (and checks its checksum). It puts NVDA in the VM's shared folder, Windows installs it from there, and the installer is then deleted. The shared folder stays, so you can drop in a Firefox or Brave installer next.
+- **Tiny11:** Microsoft doesn't host it, so give it with `--iso-url` or `--iso-path`. Before the VM is made, vmctl looks inside the ISO's install image for Microsoft Edge (`msedge.exe`). This only reads the image's file list and takes about a second.
+  - **Edge is still there:** Windows uses Edge and downloads NVDA itself, the same way as the other Windows VMs.
+  - **Edge was removed** (tiny11builder removes it): the server downloads the newest Firefox (64-bit MSI, checked against Mozilla's SHA512SUMS) and NVDA (checked against NV Access's checksum) into the VM's shared folder. Windows copies Firefox over and installs it first, then installs NVDA. Each installer is deleted from the folder once it is installed.
+
+  Either way the shared folder stays, so you can drop in other installers later. `vmctl info NAME` shows which browser the VM got.
 
 ## Everyday commands
 
