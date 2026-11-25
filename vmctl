@@ -172,6 +172,10 @@ EOF
 
 vm_env()  { printf '%s/%s.env' "$VMS_DIR" "$1"; }
 vm_fwd()  { printf '%s/%s.fwd' "$VMS_DIR" "$1"; }
+# Host ports a VM may reach on this server's own addresses (vmctl hostport).
+# "all" = every VM; its rules carry the ufw comment tag "@all".
+vm_host() { if [[ $1 == all ]]; then printf '%s/host-all.ports' "$CONF_DIR"; else printf '%s/%s.host' "$VMS_DIR" "$1"; fi; }
+host_tag() { if [[ $1 == all ]]; then echo @all; else echo "$1"; fi; }
 vm_vv()   { printf '%s/%s.vv' "$VIEWER_DIR" "$1"; }
 vm_plog() { printf '%s/logs/%s-progress.log' "$STORE" "$1"; }   # Windows COM1 output
 vm_elog() { printf '%s/logs/%s-events.log' "$STORE" "$1"; }     # what vmctl itself did (watcher etc.)
@@ -609,6 +613,43 @@ fw_vm_del() {   # fw_vm_del NAME [suffix-regex]
     ufw_delete_comment "vmctl:$1:${2:-.*}"
 }
 
+# ufw rules letting a VM (or "all" VMs) in to the host ports in its .host file,
+# so they work even when the port is not open to the internet.
+fw_host_add() {   # fw_host_add NAME|all
+    local name=$1 f src proto port label
+    f=$(vm_host "$name")
+    [[ $(fw_mode) == ufw && -f $f ]] || return 0
+    if [[ $name == all ]]; then src=$NET_PREFIX.0/24; else src=$(sed -n 's/^IP=//p' "$(vm_env "$name")"); fi
+    [[ -n $src ]] || return 0
+    while read -r proto port label; do
+        [[ -n ${proto:-} && ${proto:0:1} != '#' ]] || continue
+        ufw_add allow in on "$BRIDGE" proto "$proto" from "$src" to any port "${port/-/:}" \
+            comment "vmctl:$(host_tag "$name"):host:$proto:$port"
+    done <"$f"
+}
+
+host_rules() {   # nft prerouting lines: VM -> this server's public address, chosen ports
+    local f name src proto port label
+    for f in "$VMS_DIR"/*.host "$(vm_host all)"; do
+        [[ -f $f ]] || continue
+        if [[ $f == "$(vm_host all)" ]]; then name=all; src=$NET_PREFIX.0/24
+        else
+            name=$(basename "$f" .host)
+            [[ -f $(vm_env "$name") ]] || continue
+            src=$(sed -n 's/^IP=//p' "$(vm_env "$name")")
+        fi
+        echo "    # $name: ports on this server"
+        while read -r proto port label; do
+            [[ -n ${proto:-} && ${proto:0:1} != '#' ]] || continue
+            # Sending the packet to the bridge address makes the reply come
+            # back through conntrack, which puts the public address back as
+            # its source. Without this, UDP servers bound to 0.0.0.0 (TeamTalk)
+            # answer from $NET_PREFIX.1 and the client throws the reply away.
+            echo "    iifname \"$BRIDGE\" ip saddr $src fib daddr type local ip daddr != $NET_PREFIX.1 $proto dport $port dnat to $NET_PREFIX.1"
+        done <"$f"
+    done
+}
+
 # Rebuild the nftables DNAT/masquerade table from every VM's .fwd file, plus
 # plain-iptables accept rules on hosts without ufw.
 dnat_rules() {   # one "fib daddr type local ... dnat" line per forward of every VM
@@ -637,6 +678,7 @@ apply_forwards() {
         echo "  chain prerouting {"
         echo "    type nat hook prerouting priority dstnat; policy accept;"
         echo "$rules"
+        host_rules
         echo "  }"
         echo "  chain output {"
         echo "    type nat hook output priority -100; policy accept;"
@@ -681,6 +723,21 @@ apply_forwards() {
                       else iptables -A VMCTL-FWD -s "$src" -d "$IP" -p "$proto" --dport "$gp" -j ACCEPT 2>/dev/null || true; fi
                   done < <(split_allow "$allow")
               done <"$(vm_fwd "$name")" )
+        done
+        # vmctl hostport: VMs in to ports on this server itself.
+        local hf hsrc port
+        for hf in "$VMS_DIR"/*.host "$(vm_host all)"; do
+            [[ -f $hf ]] || continue
+            if [[ $hf == "$(vm_host all)" ]]; then hsrc=$NET_PREFIX.0/24
+            else
+                name=$(basename "$hf" .host)
+                [[ -f $(vm_env "$name") ]] || continue
+                hsrc=$(sed -n 's/^IP=//p' "$(vm_env "$name")")
+            fi
+            while read -r proto port label; do
+                [[ -n ${proto:-} && ${proto:0:1} != '#' ]] || continue
+                iptables -A VMCTL-IN -i "$BRIDGE" -s "$hsrc" -p "$proto" --dport "${port/-/:}" -j ACCEPT 2>/dev/null || true
+            done <"$hf"
         done
     fi
 }
@@ -3777,6 +3834,15 @@ cmd_info() {
             esac
         done <"$(vm_fwd "$name")"
     fi
+    local hf hnote
+    for hf in "$(vm_host "$name")" "$(vm_host all)"; do
+        [[ -f $hf ]] || continue
+        hnote=; [[ $hf == "$(vm_host all)" ]] && hnote=", set for all VMs"
+        while read -r proto hp label; do
+            [[ -n ${proto:-} && ${proto:0:1} != '#' ]] || continue
+            msg "  Can reach port $hp $proto on this server ($label$hnote): $PUBLIC_HOST:$hp"
+        done <"$hf"
+    done
     [[ $KIND == linux ]] && msg "  Serial console on this server: vmctl console $name"
     local d
     for d in ${DATA_DISKS:-}; do
@@ -3889,6 +3955,94 @@ cmd_forward() {
             done
             (( any )) || msg "No port forwards." ;;
         *) die "usage: vmctl forward add|del|list ..." ;;
+    esac
+}
+
+usage_hostport() {
+    cat <<EOF
+vmctl hostport: let VMs reach programs running on this server itself (for
+example a TeamTalk server), using this server's normal address
+($PUBLIC_HOST). Both TCP and UDP work, also for ports that are closed to
+the internet.
+
+  vmctl hostport add NAME|all PORT[-END] [tcp|udp|both] [LABEL]
+        let one VM (or every VM) connect to PORT (or a range) on this server.
+        tcp, udp or both (default both). LABEL is a note for yourself.
+  vmctl hostport remove NAME|all PORT[-END] [tcp|udp]
+        take it away again (both protocols unless you say tcp or udp).
+        "del" and "delete" work too.
+  vmctl hostport list [NAME|all]
+
+Example: vmctl hostport add aaronVM 10490 both teamtalk
+EOF
+}
+
+cmd_hostport() {
+    local sub=${1-}; shift || true
+    case $sub in
+        add)
+            local name=${1-} port=${2-} proto=both label=host a b p
+            [[ -n $name && -n $port ]] || die "usage: vmctl hostport add NAME|all PORT[-END] [tcp|udp|both] [LABEL]"
+            shift 2
+            if (( $# )); then case $1 in tcp|udp|both) proto=$1; shift ;; esac; fi
+            (( $# )) && label=$1
+            [[ $label =~ ^[A-Za-z0-9._-]{1,30}$ ]] || die "the label can only use letters, numbers, dots, dashes and underscores (up to 30)"
+            [[ $name == all ]] || load_vm "$name"
+            [[ $port =~ ^([0-9]+)(-([0-9]+))?$ ]] || die "port must be a number (1-65535) or a range like 10490-10500"
+            a=${BASH_REMATCH[1]}; b=${BASH_REMATCH[3]:-$a}
+            (( a >= 1 && b <= 65535 && a <= b )) || die "port must be 1-65535 (and a range must go low-high)"
+            [[ $a == "$b" ]] && port=$a
+            # Docker publishes its ports with its own address translation;
+            # two translations for the same port would fight.
+            # (no "| grep -q" under pipefail: SIGPIPE makes it fail at random)
+            if [[ $(ss -Hlntup 2>/dev/null | awk -v a="$a" -v b="$b" '{n=split($5,x,":"); q=x[n]+0} q>=a && q<=b') == *docker-proxy* ]]; then
+                die "Docker publishes a port in $port; VMs can already reach Docker ports at $PUBLIC_HOST, nothing to add"
+            fi
+            local f; f=$(vm_host "$name")
+            local ps=("$proto"); [[ $proto == both ]] && ps=(tcp udp)
+            for p in "${ps[@]}"; do
+                if [[ -f $f ]] && awk -v pr="$p" -v po="$port" '!/^#/ && $1==pr && $2==po {f=1} END {exit !f}' "$f"; then
+                    msg "$name can already reach port $port ($p)."; continue
+                fi
+                echo "$p $port $label" >>"$f"
+            done
+            chmod 600 "$f"
+            fw_host_add "$name"; apply_forwards
+            local who="$name"; [[ $name == all ]] && who="every VM"
+            msg "$who can now connect to port $port ($proto) on this server, at $PUBLIC_HOST or at $NET_PREFIX.1."
+            if ! ss -Hlntu 2>/dev/null | awk -v a="$a" -v b="$b" '{n=split($5,x,":"); q=x[n]+0} q>=a && q<=b {f=1} END {exit !f}'; then
+                warn "nothing on this server is listening on port $port yet; it will work once something does"
+            fi ;;
+        del|delete|remove|rm)
+            local name=${1-} port=${2-} proto=${3-} f
+            [[ -n $name && -n $port ]] || die "usage: vmctl hostport remove NAME|all PORT[-END] [tcp|udp]"
+            [[ -z $proto || $proto == tcp || $proto == udp || $proto == both ]] || die "protocol must be tcp or udp"
+            [[ $proto == both ]] && proto=
+            [[ $name == all ]] || load_vm "$name"
+            f=$(vm_host "$name")
+            [[ -f $f ]] && awk -v po="$port" -v pr="$proto" '!/^#/ && $2==po && (pr=="" || $1==pr) {f=1} END {exit !f}' "$f" \
+                || die "$name has no host port $port${proto:+ ($proto)} (see: vmctl hostport list)"
+            awk -v po="$port" -v pr="$proto" '/^#/ || !($2==po && (pr=="" || $1==pr))' "$f" >"$f.tmp" && mv "$f.tmp" "$f"
+            [[ -s $f ]] || rm -f "$f"
+            if [[ $(fw_mode) == ufw ]]; then
+                ufw_delete_comment "vmctl:$(host_tag "$name"):host:${proto:-(tcp|udp)}:$port"
+            fi
+            apply_forwards
+            msg "Removed port $port${proto:+ ($proto)} on this server from $name." ;;
+        list|"")
+            local name=${1-} f n any=0 proto port label
+            for f in "$VMS_DIR"/*.host "$(vm_host all)"; do
+                [[ -f $f ]] || continue
+                if [[ $f == "$(vm_host all)" ]]; then n=all; else n=$(basename "$f" .host); fi
+                [[ -z $name || $name == "$n" ]] || continue
+                while read -r proto port label; do
+                    [[ -n ${proto:-} && ${proto:0:1} != '#' ]] || continue
+                    msg "$n: can reach port $port $proto on this server ($label)"; any=1
+                done <"$f"
+            done
+            (( any )) || msg "No host ports. Add one with: vmctl hostport add NAME PORT" ;;
+        help|-h|--help) usage_hostport ;;
+        *) die "usage: vmctl hostport add|remove|list ... (see: vmctl hostport help)" ;;
     esac
 }
 
@@ -4383,7 +4537,8 @@ remove_network() {   # remove the private VM network and everything set up for i
     case $(fw_mode) in
         ufw)
             msg "  Deleting the VM network's firewall rules (ufw rules marked vmctl:net)"
-            ufw_delete_comment 'vmctl:net' ;;
+            ufw_delete_comment 'vmctl:net'
+            ufw_delete_comment 'vmctl:@all:host:.*' ;;
         iptables)
             msg "  Deleting vmctl's iptables chains (VMCTL-IN, VMCTL-FWD)"
             iptables -D FORWARD -j VMCTL-FWD 2>/dev/null || true
@@ -4395,7 +4550,7 @@ remove_network() {   # remove the private VM network and everything set up for i
         msg "  Deleting vmctl's NAT and port-forward table (nftables table ip vmctl)"
         nft delete table ip vmctl
     fi
-    rm -f "$NFT_FILE"
+    rm -f "$NFT_FILE" "$(vm_host all)"
     if [[ -f /etc/sysctl.d/90-vmctl.conf ]]; then
         # Only vmctl's own setting file; forwarding stays on until the next
         # boot, since other software (Docker, for example) may rely on it.
@@ -4453,7 +4608,7 @@ cmd_delete() {
         rmdir "$(dirname "$SHARE_DIR")" 2>/dev/null || true   # vmshare/ when it is now empty
         msg "Deleted the shared folder $SHARE_DIR."
     fi
-    rm -f "$DISK" "${SEED:-/nonexistent}" "$(vm_env "$name")" "$(vm_fwd "$name")" "$(vm_vv "$name")" \
+    rm -f "$DISK" "${SEED:-/nonexistent}" "$(vm_env "$name")" "$(vm_fwd "$name")" "$(vm_host "$name")" "$(vm_vv "$name")" \
           "$(vm_plog "$name")" "$(vm_elog "$name")"
     apply_forwards
     msg "Deleted $name."
@@ -5153,6 +5308,10 @@ vmctl $VMCTL_VERSION - create and manage virtual machines on this server
   vmctl forward add NAME HOSTPORT|auto GUESTPORT [tcp|udp|both] [--allow LIST]
   vmctl forward del NAME HOSTPORT [tcp|udp]
   vmctl forward list [NAME]
+  vmctl hostport add NAME|all PORT[-END] [tcp|udp|both] [LABEL]
+                                 let a VM reach a program on this server (e.g. TeamTalk), TCP and UDP
+  vmctl hostport remove NAME|all PORT[-END] [tcp|udp]
+  vmctl hostport list [NAME]     (see: vmctl hostport help)
   vmctl start NAME [--no-watch]  start a VM and read out its boot messages until it is ready
   vmctl reboot NAME [--no-watch] restart a VM and read out its boot messages
   vmctl boot NAME [--minutes N]  follow a VM that is already booting (disk checks, repairs, updates)
@@ -5223,6 +5382,7 @@ main() {
         eject)    cmd_eject "$@" ;;
         delete|rm) cmd_delete "$@" ;;
         apply)    apply_forwards; resume_installs ;;
+        hostport|hostports) cmd_hostport "$@" ;;
         autostart) cmd_autostart "$@" ;;
         check)    ensure_network; vmsg "Server check finished: ready to run virtual machines" ;;
         disk)     cmd_disk "$@" ;;

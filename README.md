@@ -88,6 +88,8 @@ To connect:
 | `vmctl progress NAME` | Follow a Windows install step by step |
 | `vmctl password NAME [USER]` | Reset a password inside the VM |
 | `vmctl forward add NAME HOSTPORT GUESTPORT` | Open another port to the VM |
+| `vmctl hostport add NAME PORT` | Let the VM reach a program on the server itself, TCP and UDP (see below) |
+| `vmctl hostport remove NAME PORT` | Take that away again |
 | `vmctl disk add NAME SIZE` | Add a data disk (formatted and mounted for you) |
 | `vmctl edit NAME` | Change RAM, CPU cores or disk sizes (menu, or `--ram`, `--cpus`, `--disk`, `--data-disk`) |
 | `vmctl disk grow NAME ID SIZE` | Make one disk bigger (`system`, `data1`...) and use the space inside the VM |
@@ -172,6 +174,18 @@ Settings are in `/etc/vmctl/vmctl.conf`, written the first time vmctl runs. To c
 VMs live on a private libvirt network (`vmctl`, bridge `virbr-vmctl`). vmctl reaches them from outside with its own nftables table (`table ip vmctl`), which does the port forwarding, and it rebuilds that table at boot (`vmctl-forwards.service`). If ufw is active, vmctl also adds the matching `ufw route allow` rules. All of its rules carry a comment starting with `vmctl:`, and they are removed again when a VM is deleted. Other firewall rules are left alone.
 
 A host port that is already in use (by another VM or by any service listening on the server) is refused, so other services are not disturbed. The remote-viewer ports start at 5910, not 5900, to keep clear of other software that uses 5900.
+
+### Reaching programs on the server from a VM (`vmctl hostport`)
+
+```sh
+sudo vmctl hostport add NAME|all PORT[-END] [tcp|udp|both] [LABEL]   # both is the default
+sudo vmctl hostport remove NAME|all PORT[-END] [tcp|udp]
+sudo vmctl hostport list [NAME]
+```
+
+Example: `sudo vmctl hostport add win11 10490 both teamtalk` lets the VM `win11` log in to a TeamTalk server running on the same machine, using the server's normal name or address.
+
+Why this is needed: when a VM connects to the server's public address, TCP works, but a UDP server that listens on every address (TeamTalk does) answers from the private network's gateway address instead of the public one. The VM's program then ignores the answer and never connects. For each port you add, vmctl sends the VM's traffic to the gateway address instead, so the reply goes back to the VM from the public address it expects. It also adds a ufw rule (comment `vmctl:NAME:host:...`) so this works even for ports that are closed to the internet. Ports published by Docker are refused, because Docker already handles those.
 
 ## Where things are
 
